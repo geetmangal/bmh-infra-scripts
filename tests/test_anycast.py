@@ -186,11 +186,38 @@ class ControllerTests(unittest.TestCase):
         self.assertTrue(s["announced"])
         self.assertEqual(s["checks"][0]["name"], "dead")
 
-    def test_backend_error_counted(self):
-        ctl = anycast.Controller(self._cfg(fail_threshold=1), FakeBackend(fail=True))
-        ctl.round()
-        self.assertEqual(ctl.backend_errors, 1)
-        self.assertFalse(ctl.fsm.announced, "state flips even if backend failed, so the next round retries nothing twice")
+    def test_backend_failure_keeps_state_and_retries(self):
+        fb = FakeBackend(fail=True)
+        with tempfile.TemporaryDirectory() as d:
+            mf = os.path.join(d, "m.prom")
+            ctl = anycast.Controller(self._cfg(fail_threshold=1, metrics_file=mf), fb)
+            _, t = ctl.round()
+            self.assertEqual(t, "withdraw")
+            self.assertEqual(ctl.backend_errors, 1)
+            self.assertTrue(ctl.fsm.announced, "state must not flip when the router command failed")
+            with open(mf, encoding="utf-8") as fh:
+                self.assertIn('anycast_backend_action_failed{action="withdraw"} 1', fh.read())
+            # next interval retries; once the backend works the state commits
+            fb.fail = False
+            _, t = ctl.round()
+            self.assertEqual(t, "withdraw")
+            self.assertEqual(fb.calls, ["withdraw", "withdraw"])
+            self.assertFalse(ctl.fsm.announced)
+            self.assertIsNone(ctl.pending)
+            with open(mf, encoding="utf-8") as fh:
+                self.assertIn('anycast_backend_action_failed{action=""} 0', fh.read())
+            # steady state: no further backend calls
+            ctl.round()
+            self.assertEqual(fb.calls, ["withdraw", "withdraw"])
+
+    def test_feed_without_commit(self):
+        h = anycast.Hysteresis(1, 1)
+        self.assertEqual(h.feed(False, commit=False), "withdraw")
+        self.assertTrue(h.announced)
+        self.assertEqual(h.feed(False, commit=False), "withdraw")
+        h.commit("withdraw")
+        self.assertFalse(h.announced)
+        self.assertIsNone(h.feed(False, commit=False))
 
     def test_state_file_roundtrip(self):
         with tempfile.TemporaryDirectory() as d:
@@ -201,6 +228,43 @@ class ControllerTests(unittest.TestCase):
             self.assertTrue(os.path.exists(sf))
             ctl2 = anycast.Controller(cfg, FakeBackend())
             self.assertFalse(ctl2.fsm.announced)
+
+
+class CheckOnceTests(unittest.TestCase):
+    """--check-once is a monitoring probe: it must not touch the router unless --apply is given."""
+
+    def _write_cfg(self, d, marker):
+        cfg = {"prefix": "203.0.113.1/32", "fail_threshold": 1, "ok_threshold": 1, "backend": "exec",
+               "state_file": os.path.join(d, "state.json"), "metrics_file": os.path.join(d, "m.prom"),
+               "exec_up": f"touch {marker}.up", "exec_down": f"touch {marker}.down",
+               "checks": [{"name": "dead", "type": "tcp", "host": "127.0.0.1", "port": 1, "timeout": 0.3}]}
+        path = os.path.join(d, "c.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(cfg, fh)
+        return path
+
+    def test_check_once_is_report_only(self):
+        with tempfile.TemporaryDirectory() as d:
+            marker = os.path.join(d, "hook")
+            rc = anycast.main(["-c", self._write_cfg(d, marker), "--check-once", "--json", "-q"])
+            self.assertEqual(rc, 1)
+            self.assertFalse(os.path.exists(marker + ".down"), "withdraw hook ran without --apply")
+            self.assertFalse(os.path.exists(os.path.join(d, "state.json")))
+            self.assertFalse(os.path.exists(os.path.join(d, "m.prom")))
+
+    def test_check_once_apply_acts(self):
+        with tempfile.TemporaryDirectory() as d:
+            marker = os.path.join(d, "hook")
+            rc = anycast.main(["-c", self._write_cfg(d, marker), "--check-once", "--apply", "-q"])
+            self.assertEqual(rc, 1)
+            self.assertTrue(os.path.exists(marker + ".down"))
+            self.assertTrue(os.path.exists(os.path.join(d, "state.json")))
+
+    def test_apply_flag_validation(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = self._write_cfg(d, os.path.join(d, "hook"))
+            self.assertEqual(anycast.main(["-c", path, "--apply", "-q"]), 2)
+            self.assertEqual(anycast.main(["-c", path, "--check-once", "--apply", "--dry-run", "-q"]), 2)
 
 
 if __name__ == "__main__":

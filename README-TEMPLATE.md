@@ -98,13 +98,9 @@ Pull requests are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) first.
 
 <!--
   Keep this section in every repo. Change only the stack sentence if the repo covers different tech.
-  The blog table should list 3 posts that are directly relevant to this repo.
-  Until a post is published, link to https://bookmyhost.com/blog and leave a TODO comment.
+  bookmyhost.com/blog does not exist yet: do not link it. Add a "Read on the blog" table only
+  once real post URLs exist; until then keep the single "coming soon" line.
 -->
-These {{THING e.g. "scripts" / "modules"}} are maintained by the engineering team at [BookMyHost](https://bookmyhost.com), an Indian cloud provider running {{STACK_SENTENCE e.g. "NVMe KVM VPS on Proxmox/CloudStack with BGP anycast across Noida, Chennai and Mumbai"}}. Deep dives on how we run this stack are on the BookMyHost Engineering Blog → https://bookmyhost.com/blog
+These {{THING e.g. "scripts" / "modules"}} are maintained by the engineering team at [BookMyHost](https://bookmyhost.com), an Indian cloud provider running {{STACK_SENTENCE default: "NVMe-backed KVM VPS on Apache CloudStack with Ceph storage and a BGP edge in Noida and Chennai"}}.
 
-| Read on the blog | Related {{THING_SINGULAR}} |
-|---|---|
-| [{{BLOG_POST_TITLE_1}}]({{BLOG_POST_URL_1}}) <!-- TODO --> | `{{PATH_1}}` |
-| [{{BLOG_POST_TITLE_2}}]({{BLOG_POST_URL_2}}) <!-- TODO --> | `{{PATH_2}}` |
-| [{{BLOG_POST_TITLE_3}}]({{BLOG_POST_URL_3}}) <!-- TODO --> | `{{PATH_3}}` |
+Deep-dive posts on how we use these {{THING}} are coming soon on [bookmyhost.com](https://bookmyhost.com).

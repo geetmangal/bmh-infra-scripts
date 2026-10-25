@@ -2,7 +2,7 @@
 """anycast-healthcheck.py - withdraw / announce an anycast prefix based on local service health.
 
 Part of bmh-infra-scripts (https://github.com/geetmangal/bmh-infra-scripts)
-Maintained by the BookMyHost engineering team - https://bookmyhost.com/blog
+Maintained by the BookMyHost engineering team - https://bookmyhost.com
 Licence: MIT.  Standard library only (Python 3.8+), no pip dependencies.
 
 How it works
@@ -403,21 +403,30 @@ class Hysteresis:
     def announced(self) -> bool:
         return self.state == self.ANNOUNCED
 
-    def feed(self, healthy: bool) -> Optional[str]:
-        """Record one round. Returns 'announce' / 'withdraw' when the state flips, else None."""
+    def feed(self, healthy: bool, commit: bool = True) -> Optional[str]:
+        """Record one round. Returns 'announce' / 'withdraw' when the state should flip, else None.
+
+        With ``commit=False`` the state is left unchanged; call :meth:`commit` once the
+        backend action succeeded.  Until then every round keeps returning the same
+        transition, so a failed router command is retried on the next interval.
+        """
+        transition = None
         if healthy:
             self.consecutive_ok += 1
             self.consecutive_fail = 0
             if self.state == self.WITHDRAWN and self.consecutive_ok >= self.ok_threshold:
-                self.state = self.ANNOUNCED
-                return "announce"
+                transition = "announce"
         else:
             self.consecutive_fail += 1
             self.consecutive_ok = 0
             if self.state == self.ANNOUNCED and self.consecutive_fail >= self.fail_threshold:
-                self.state = self.WITHDRAWN
-                return "withdraw"
-        return None
+                transition = "withdraw"
+        if transition and commit:
+            self.commit(transition)
+        return transition
+
+    def commit(self, transition: str) -> None:
+        self.state = self.ANNOUNCED if transition == "announce" else self.WITHDRAWN
 
     def to_dict(self) -> Dict[str, Any]:
         return {"state": self.state, "consecutive_fail": self.consecutive_fail, "consecutive_ok": self.consecutive_ok}
@@ -558,6 +567,8 @@ class Controller:
         self.last_change = 0.0
         self.rounds = 0
         self.backend_errors = 0
+        self.report_only = False               # --check-once without --apply: decide, never act
+        self.pending: Optional[str] = None     # transition whose backend action failed, retried next round
         self._load_state()
 
     # state persistence
@@ -605,6 +616,9 @@ class Controller:
             "# HELP anycast_backend_errors_total backend command failures",
             "# TYPE anycast_backend_errors_total counter",
             f"anycast_backend_errors_total {self.backend_errors}",
+            "# HELP anycast_backend_action_failed 1 while a withdraw/announce failed and is being retried",
+            "# TYPE anycast_backend_action_failed gauge",
+            f'anycast_backend_action_failed{{action="{self.pending or ""}"}} {int(bool(self.pending))}',
             "# HELP anycast_check_up per-check result",
             "# TYPE anycast_check_up gauge",
             "# HELP anycast_check_latency_ms per-check latency",
@@ -630,9 +644,20 @@ class Controller:
         healthy = all(r.ok for r in self.last_results)
         for r in self.last_results:
             (LOG.debug if r.ok else LOG.warning)("check %-16s %s %.1fms %s", r.name, "OK  " if r.ok else "FAIL", r.latency_ms, r.detail)
-        transition = self.fsm.feed(healthy)
-        if transition:
-            self._apply(transition)
+        # the state commits only after the backend action succeeded; a failure leaves
+        # the FSM where it was, so the same transition is attempted again next round
+        transition = self.fsm.feed(healthy, commit=False)
+        if transition and self.report_only:
+            LOG.info("report-only: would %s %s", transition, self.cfg.prefix or "prefix")
+        elif transition:
+            if self._apply(transition):
+                self.fsm.commit(transition)
+                self.pending = None
+            else:
+                self.pending = transition
+                LOG.error("state stays %s; %s will be retried next interval", self.fsm.state, transition)
+        else:
+            self.pending = None
         self._save_state()
         self._write_metrics(healthy)
         return healthy, transition
@@ -663,6 +688,7 @@ class Controller:
             "healthy": healthy,
             "announced": self.fsm.announced,
             "transition": transition,
+            "backend_failed": bool(self.pending),
             "consecutive_fail": self.fsm.consecutive_fail,
             "consecutive_ok": self.fsm.consecutive_ok,
             "checks": [r.__dict__ for r in self.last_results],
@@ -711,7 +737,9 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("-c", "--config", default=os.environ.get("ANYCAST_CONFIG", "/etc/anycast-healthcheck.yaml"), help="YAML (subset) or JSON config file")
-    p.add_argument("--check-once", action="store_true", help="run one round, print result, exit 0/1")
+    p.add_argument("--check-once", action="store_true",
+                   help="run one round, print result, exit 0/1; report-only (no router change, no files) unless --apply")
+    p.add_argument("--apply", action="store_true", help="with --check-once: really announce/withdraw and write state/metrics")
     p.add_argument("--json", action="store_true", help="JSON output (with --check-once) / JSON log lines in daemon mode")
     p.add_argument("--dry-run", action="store_true", help="never call the backend or write files")
     p.add_argument("--backend", choices=["bird", "vyos", "exec"], help="override config backend")
@@ -779,17 +807,29 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(json.dumps({"error": str(exc)}))
         return 2
 
-    backend = make_backend(cfg, args.dry_run)
-    ctl = Controller(cfg, backend, dry_run=args.dry_run)
+    if args.apply and not args.check_once:
+        LOG.error("--apply only makes sense with --check-once (the daemon always applies)")
+        return 2
+    if args.apply and args.dry_run:
+        LOG.error("--apply and --dry-run are mutually exclusive")
+        return 2
+    # --check-once is a monitoring probe: report-only unless --apply is given explicitly
+    report_only = args.check_once and not args.apply
+    backend = make_backend(cfg, args.dry_run or report_only)
+    ctl = Controller(cfg, backend, dry_run=args.dry_run or report_only)
+    ctl.report_only = report_only
 
     if args.check_once:
         healthy, transition = ctl.round()
         if args.json:
-            print(json.dumps(ctl.summary(healthy, transition), indent=2))
+            out = ctl.summary(healthy, transition)
+            out["report_only"] = report_only
+            print(json.dumps(out, indent=2))
         else:
             for r in ctl.last_results:
                 print(f"{'OK  ' if r.ok else 'FAIL'} {r.name:<16} {r.latency_ms:7.1f} ms  {r.detail}")
-            print(f"healthy={healthy} announced={ctl.fsm.announced} transition={transition}")
+            mode = " (report-only, router untouched; use --apply to act)" if report_only and transition else ""
+            print(f"healthy={healthy} announced={ctl.fsm.announced} transition={transition}{mode}")
         if transition and ctl.backend_errors:
             return 3
         return 0 if healthy else 1

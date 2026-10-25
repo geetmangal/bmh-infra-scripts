@@ -2,7 +2,7 @@
 """vcenter-snapshot-report.py - report on (and optionally delete) VMware vCenter snapshots.
 
 Part of bmh-infra-scripts (https://github.com/geetmangal/bmh-infra-scripts)
-Maintained by the BookMyHost engineering team - https://bookmyhost.com/blog
+Maintained by the BookMyHost engineering team - https://bookmyhost.com
 Licence: MIT
 
 Requires pyvmomi (``pip install -r requirements.txt``).  The import is guarded so
@@ -37,12 +37,12 @@ __version__ = "1.0.0"
 
 try:  # pragma: no cover - exercised only with pyvmomi installed
     from pyVim.connect import Disconnect, SmartConnect
-    from pyVmomi import vim
+    from pyVmomi import vim, vmodl
 
     HAVE_PYVMOMI = True
 except ImportError:  # pragma: no cover
     HAVE_PYVMOMI = False
-    vim = None  # type: ignore[assignment]
+    vim = vmodl = None  # type: ignore[assignment]
 
 
 def colour(code: str, text: str) -> str:
@@ -98,28 +98,53 @@ def age_days(created: datetime, now: Optional[datetime] = None) -> float:
     return round((now - created).total_seconds() / 86400.0, 2)
 
 
-def snapshot_size_bytes(layout_ex: Any, snapshot_ref: Any) -> int:
-    """Sum the sizes of the files that belong to a snapshot using VM layoutEx.
+def _ref_id(ref: Any) -> Any:
+    """Stable identity for a snapshot ref: the MoRef id on real pyvmomi objects."""
+    moid = getattr(ref, "_moId", None)
+    return moid if moid is not None else id(ref)
 
-    layoutEx.snapshot[] maps a snapshot ref to its dataKey/memoryKey and per-disk
-    chain; each disk chain's fileKey list points into layoutEx.file[] whose entries
-    carry ``size``. We count every unique file key referenced by this snapshot.
+
+def _chain_keys(disks: Any) -> Dict[Any, set]:
+    """{diskKey: set(fileKeys)} for a layoutEx disk list (snapshot[].disk or disk)."""
+    out: Dict[Any, set] = {}
+    for disk in disks or []:
+        keys: set = set()
+        for chain in getattr(disk, "chain", None) or []:
+            keys.update(getattr(chain, "fileKey", None) or [])
+        out[getattr(disk, "key", None)] = keys
+    return out
+
+
+def snapshot_size_bytes(layout_ex: Any, snapshot_ref: Any, children: Iterable[Any] = (),
+                        is_current: bool = False) -> int:
+    """Bytes a snapshot holds on the datastore, from VM layoutEx.
+
+    layoutEx.snapshot[].disk[].chain is the *full* disk chain at the time of the
+    snapshot (base disk included), so summing it counts the base disk too.  The space
+    attributable to snapshot S is its state/memory files plus the delta disks written
+    after S: files in a child snapshot's chain (or, for the current snapshot, the
+    VM's live disk chain) that are not already in S's chain.
     """
     if layout_ex is None or not getattr(layout_ex, "file", None):
         return 0
     size_by_key: Dict[int, int] = {f.key: int(getattr(f, "size", 0) or 0) for f in layout_ex.file}
+    by_ref = {_ref_id(s.key): s for s in getattr(layout_ex, "snapshot", None) or []}
+    snap = by_ref.get(_ref_id(snapshot_ref))
+    if snap is None:
+        return 0
     keys: set = set()
-    for snap in getattr(layout_ex, "snapshot", None) or []:
-        if snap.key != snapshot_ref:
-            continue
-        if getattr(snap, "dataKey", None) is not None and snap.dataKey >= 0:
-            keys.add(snap.dataKey)
-        if getattr(snap, "memoryKey", None) is not None and snap.memoryKey >= 0:
-            keys.add(snap.memoryKey)
-        for disk in getattr(snap, "disk", None) or []:
-            for chain in getattr(disk, "chain", None) or []:
-                for fk in getattr(chain, "fileKey", None) or []:
-                    keys.add(fk)
+    for attr in ("dataKey", "memoryKey"):
+        val = getattr(snap, attr, None)
+        if val is not None and val >= 0:
+            keys.add(val)
+    own = _chain_keys(getattr(snap, "disk", None))
+    nexts = [_chain_keys(getattr(by_ref[_ref_id(c)], "disk", None)) for c in children if _ref_id(c) in by_ref]
+    if is_current:
+        nexts.append(_chain_keys(getattr(layout_ex, "disk", None)))
+    for nxt in nexts:
+        for disk_key, files in nxt.items():
+            if disk_key in own:  # a disk added after the snapshot is not snapshot data
+                keys.update(files - own[disk_key])
     return sum(size_by_key.get(k, 0) for k in keys)
 
 
@@ -145,6 +170,64 @@ def folder_path(vm: Any) -> str:
     return "/" + "/".join(reversed(parts))
 
 
+def vm_state(vm: Any) -> str:
+    """'on'/'off'/'suspended', 'template', or the connection state for inaccessible/orphaned VMs."""
+    runtime = getattr(vm, "runtime", None)
+    conn = str(getattr(runtime, "connectionState", "connected") or "connected")
+    if conn != "connected":
+        return conn
+    if getattr(getattr(vm, "config", None), "template", False):
+        return "template"
+    power = str(getattr(runtime, "powerState", None) or "unknown")
+    return {"poweredOn": "on", "poweredOff": "off"}.get(power, power)
+
+
+def records_from_properties(vm_objs: Iterable[Any], folder_objs: Iterable[Any] = ()) -> List[Any]:
+    """Turn PropertyCollector results into VM-like records that rows_for_vm() accepts.
+
+    Each input item is ``(moid, {propPath: value})``.  Missing properties (inaccessible
+    or orphaned VMs, permission gaps) simply stay ``None``.  ``folder_objs`` carries
+    ``name``/``parent`` for Folder and Datacenter objects so the folder path is
+    resolved locally instead of with one round trip per parent.
+    """
+    from types import SimpleNamespace as NS  # noqa: N814
+
+    folders = {moid: props for moid, props in folder_objs}
+
+    def path(parent: Any) -> str:
+        parts: List[str] = []
+        seen = 0
+        pid = getattr(parent, "_moId", parent)
+        while pid in folders and seen < 64:
+            name = folders[pid].get("name")
+            if name and name not in ("vm", "Datacenters"):
+                parts.append(name)
+            nxt = folders[pid].get("parent")
+            pid = getattr(nxt, "_moId", nxt)
+            seen += 1
+        return "/" + "/".join(reversed(parts))
+
+    out = []
+    for moid, p in vm_objs:
+        layout = None
+        if p.get("layoutEx.file") is not None or p.get("layoutEx.snapshot") is not None:
+            layout = NS(file=p.get("layoutEx.file") or [], snapshot=p.get("layoutEx.snapshot") or [],
+                        disk=p.get("layoutEx.disk") or [])
+        out.append(NS(
+            _moId=str(moid),
+            name=p.get("name") or str(moid),
+            snapshot=p.get("snapshot"),
+            layoutEx=layout,
+            config=NS(template=bool(p.get("config.template"))),
+            runtime=NS(powerState=p.get("runtime.powerState"),
+                       connectionState=p.get("runtime.connectionState") or "connected",
+                       consolidationNeeded=bool(p.get("runtime.consolidationNeeded"))),
+            customValue=p.get("customValue") or [],
+            folder_path=path(p.get("parent")),
+        ))
+    return out
+
+
 def rows_for_vm(vm: Any, now: Optional[datetime] = None, tags: str = "") -> List[SnapshotRow]:
     """Build report rows for one VM-like object (real pyvmomi VM or test fake)."""
     snapinfo = getattr(vm, "snapshot", None)
@@ -152,23 +235,28 @@ def rows_for_vm(vm: Any, now: Optional[datetime] = None, tags: str = "") -> List
         return []
     layout = getattr(vm, "layoutEx", None)
     runtime = getattr(vm, "runtime", None)
-    power = str(getattr(runtime, "powerState", "unknown"))
+    power = vm_state(vm)
     consolidate = bool(getattr(runtime, "consolidationNeeded", False))
-    moid = getattr(getattr(vm, "_moId", None), "__str__", lambda: "")() or str(getattr(vm, "_moId", ""))
+    moid = str(getattr(vm, "_moId", "") or "")
+    current = getattr(snapinfo, "currentSnapshot", None)
+    folder = getattr(vm, "folder_path", None) or folder_path(vm)
     rows = []
     for node in flatten_snapshot_tree(snapinfo.rootSnapshotList):
-        created = node.createTime
+        created = getattr(node, "createTime", None)
+        kids = getattr(node, "childSnapshotList", None) or []
+        is_current = current is not None and _ref_id(current) == _ref_id(node.snapshot)
+        size = snapshot_size_bytes(layout, node.snapshot, [k.snapshot for k in kids], is_current)
         rows.append(SnapshotRow(
             vm=vm.name,
             vm_moid=moid,
-            power_state=power.replace("poweredOn", "on").replace("poweredOff", "off"),
-            folder=folder_path(vm),
+            power_state=power,
+            folder=folder,
             tags=tags,
-            snapshot=node.name,
+            snapshot=node.name or "",
             snapshot_id=int(node.id),
-            created=created.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if created.tzinfo else created.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            age_days=age_days(created, now),
-            size_gb=round(snapshot_size_bytes(layout, node.snapshot) / (1024 ** 3), 2),
+            created=(created.astimezone(timezone.utc) if created.tzinfo else created).strftime("%Y-%m-%dT%H:%M:%SZ") if created else "",
+            age_days=age_days(created, now) if created else 0.0,
+            size_gb=round(size / (1024 ** 3), 2),
             description=(node.description or "").strip().replace("\n", " ")[:120],
             consolidate_needed=consolidate,
             quiesced=bool(getattr(node, "quiesced", False)),
@@ -237,7 +325,8 @@ def read_password(args: argparse.Namespace) -> str:
             st = os.stat(args.password_file)
         except OSError as exc:
             raise SystemExit(f"[ERROR] cannot stat {args.password_file}: {exc}") from exc
-        if st.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+        # POSIX mode bits are meaningless on Windows (NTFS always reports 0o666/0o777)
+        if os.name != "nt" and st.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
             log(f"{args.password_file} is readable by group/others; chmod 0600 it", "WARN")
         with open(args.password_file, encoding="utf-8") as fh:
             return fh.readline().rstrip("\r\n")
@@ -253,38 +342,65 @@ def connect(args: argparse.Namespace):
     if not HAVE_PYVMOMI:
         log("pyvmomi is not installed. Run: pip install -r requirements.txt  (or pip install pyvmomi)", "ERROR")
         sys.exit(2)
-    ctx = ssl.create_default_context()
+    try:
+        ctx = ssl.create_default_context(cafile=args.ca_file) if args.ca_file else ssl.create_default_context()
+    except (OSError, ssl.SSLError) as exc:
+        log(f"cannot load --ca-file {args.ca_file}: {exc}", "ERROR")
+        sys.exit(2)
     if args.insecure:
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
     try:
         si = SmartConnect(host=args.host, user=args.user, pwd=read_password(args), port=args.port, sslContext=ctx)
+    except ssl.SSLError as exc:
+        log(f"TLS verification of {args.host} failed: {exc}. Use --ca-file <vCenter CA bundle> or --insecure", "ERROR")
+        sys.exit(2)
     except Exception as exc:
         log(f"connection to {args.host} failed: {exc}", "ERROR")
         sys.exit(2)
     return si
 
 
-def iter_vms(content: Any) -> Iterable[Any]:
-    view = content.viewManager.CreateContainerView(content.rootFolder, [vim.VirtualMachine], True)
+VM_PROPS = ["name", "parent", "snapshot", "layoutEx.file", "layoutEx.snapshot", "layoutEx.disk",
+            "config.template", "runtime.powerState", "runtime.connectionState",
+            "runtime.consolidationNeeded"]
+
+
+def collect(content: Any, obj_types: List[Any], paths: List[str], page: int = 500) -> List[Any]:
+    """Fetch ``paths`` for every object of ``obj_types`` in one paged PropertyCollector
+    call over a ContainerView, instead of one round trip per object and property."""
+    view = content.viewManager.CreateContainerView(content.rootFolder, obj_types, True)
     try:
-        yield from view.view
+        trav = vmodl.query.PropertyCollector.TraversalSpec(name="view", path="view", skip=False, type=vim.view.ContainerView)
+        spec = vmodl.query.PropertyCollector.FilterSpec(
+            objectSet=[vmodl.query.PropertyCollector.ObjectSpec(obj=view, skip=True, selectSet=[trav])],
+            propSet=[vmodl.query.PropertyCollector.PropertySpec(type=t, pathSet=paths, all=False) for t in obj_types],
+            reportMissingObjectsInResults=False,
+        )
+        pc = content.propertyCollector
+        out: List[Any] = []
+        res = pc.RetrievePropertiesEx([spec], vmodl.query.PropertyCollector.RetrieveOptions(maxObjects=page))
+        while res:
+            for oc in res.objects:
+                out.append((oc.obj._moId, {dp.name: dp.val for dp in (oc.propSet or [])}))
+            res = pc.ContinueRetrievePropertiesEx(res.token) if res.token else None
+        return out
     finally:
         view.Destroy()
 
 
-def vm_tags(si: Any) -> Dict[str, str]:
+def vm_tags(content: Any, records: List[Any]) -> Dict[str, str]:
     """Best-effort tag lookup via custom attributes (vSphere Tags need the REST API)."""
     out: Dict[str, str] = {}
     try:
-        content = si.RetrieveContent()
         fields = {f.key: f.name for f in content.customFieldsManager.field}
-        for vm in iter_vms(content):
-            vals = [f"{fields.get(cv.key, cv.key)}={cv.value}" for cv in (vm.customValue or []) if cv.value]
-            if vals:
-                out[vm._moId] = ";".join(vals)
     except Exception as exc:
         log(f"tag lookup skipped: {exc}", "WARN")
+        return out
+    for rec in records:
+        vals = [f"{fields.get(cv.key, cv.key)}={cv.value}" for cv in (rec.customValue or []) if getattr(cv, "value", None)]
+        if vals:
+            out[rec._moId] = ";".join(vals)
     return out
 
 
@@ -324,7 +440,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--user", default=os.environ.get("VC_USER"), help="user (env VC_USER)")
     p.add_argument("--password-file", help="0600 file holding the password (else env VC_PASS or prompt)")
     p.add_argument("--port", type=int, default=443)
-    p.add_argument("--insecure", action="store_true", help="skip TLS certificate verification")
+    p.add_argument("--insecure", action="store_true", help="skip TLS certificate verification (self-signed VMCA)")
+    p.add_argument("--ca-file", help="PEM CA bundle to verify the vCenter certificate (e.g. the VMCA root)")
     p.add_argument("--older-than", help="only snapshots at least this old, e.g. 7d, 36h, 2w")
     p.add_argument("--min-size-gb", type=float, default=0.0, help="only snapshots >= this size (GB, from layoutEx)")
     p.add_argument("--name-regex", help="only snapshots whose name matches")
@@ -359,16 +476,28 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     si = connect(args)
     try:
+        import time
+
+        t0 = time.monotonic()
         content = si.RetrieveContent()
-        tags = {} if args.no_tags else vm_tags(si)
+        props = VM_PROPS + ([] if args.no_tags else ["customValue"])
+        vms = records_from_properties(collect(content, [vim.VirtualMachine], props),
+                                      collect(content, [vim.Folder, vim.Datacenter], ["name", "parent"]))
+        tags = {} if args.no_tags else vm_tags(content, vms)
         now = datetime.now(timezone.utc)
-        vms = list(iter_vms(content))
-        by_moid = {vm._moId: vm for vm in vms}
+        states: Dict[str, int] = {}
+        for vm in vms:
+            states[vm_state(vm)] = states.get(vm_state(vm), 0) + 1
+        log(f"{getattr(content.about, 'fullName', '?')}: {len(vms)} VM(s) {dict(sorted(states.items()))} "
+            f"collected in {time.monotonic() - t0:.1f}s")
+        bad = sum(n for s, n in states.items() if s not in ("on", "off", "suspended", "template", "unknown"))
+        if bad:
+            log(f"{bad} VM(s) are not connected (inaccessible/orphaned/invalid); their snapshot data may be missing", "WARN")
 
         if args.consolidate_needed:
-            report = [{"vm": vm.name, "moid": vm._moId, "power_state": str(vm.runtime.powerState), "folder": folder_path(vm),
+            report = [{"vm": vm.name, "moid": vm._moId, "power_state": vm_state(vm), "folder": vm.folder_path,
                        "snapshots": len(flatten_snapshot_tree(vm.snapshot.rootSnapshotList if vm.snapshot else []))}
-                      for vm in vms if getattr(vm.runtime, "consolidationNeeded", False)]
+                      for vm in vms if vm.runtime.consolidationNeeded]
             if args.format == "json":
                 print(json.dumps(report, indent=2))
             elif args.format == "csv":
@@ -413,8 +542,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         failures = 0
         for r in targets:
-            vm = by_moid.get(r.vm_moid)
-            snap = find_snapshot_obj(vm, r.snapshot_id) if vm is not None else None
+            vm = vim.VirtualMachine(r.vm_moid, si._stub)
+            snap = find_snapshot_obj(vm, r.snapshot_id)
             if snap is None:
                 log(f"{r.vm}/{r.snapshot}: snapshot vanished, skipping", "WARN")
                 continue

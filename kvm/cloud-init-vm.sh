@@ -2,7 +2,7 @@
 # cloud-init-vm.sh - create an Ubuntu cloud-image KVM/libvirt VM in one command.
 #
 # Part of bmh-infra-scripts (https://github.com/geetmangal/bmh-infra-scripts)
-# Maintained by the BookMyHost engineering team - https://bookmyhost.com/blog
+# Maintained by the BookMyHost engineering team - https://bookmyhost.com
 # Licence: MIT
 #
 # Exit codes:
@@ -236,37 +236,67 @@ fi
 IMG_NAME="${CODENAME}-server-cloudimg-amd64.img"
 IMG_URL="$MIRROR/$CODENAME/current/$IMG_NAME"
 SUMS_URL="$MIRROR/$CODENAME/current/SHA256SUMS"
-BASE_IMG="$CACHE_DIR/$IMG_NAME"
+IMG_STEM="${IMG_NAME%.img}"
+# Base images are immutable and versioned: <stem>-<sha256[0:12]>.img.  A refresh
+# downloads a NEW file and repoints <stem>.current at it; existing base files are
+# never modified or deleted, because VM overlays created earlier back onto them.
+CURRENT_PTR="$CACHE_DIR/$IMG_STEM.current"
+BASE_IMG=""
 
 run mkdir -p "$CACHE_DIR" "$IMAGE_DIR"
 WORKDIR=$(mktemp -d)
 
-fetch_and_verify() {
-  info "downloading $IMG_URL"
-  run curl -fsSL --retry 3 -o "$BASE_IMG.part" "$IMG_URL"
-  run curl -fsSL --retry 3 -o "$WORKDIR/SHA256SUMS" "$SUMS_URL"
-  if [[ $DRY_RUN -eq 0 ]]; then
-    expected=$(awk -v f="*$IMG_NAME" '$2==f{print $1}' "$WORKDIR/SHA256SUMS")
-    [[ -n "$expected" ]] || { err "no checksum for $IMG_NAME in SHA256SUMS"; exit 3; }
-    actual=$(sha256sum "$BASE_IMG.part" | cut -d' ' -f1)
-    if [[ "$expected" != "$actual" ]]; then rm -f "$BASE_IMG.part"; err "checksum mismatch: expected $expected got $actual"; exit 3; fi
-    mv "$BASE_IMG.part" "$BASE_IMG"
-    printf '%s\n' "$actual" >"$BASE_IMG.sha256"
-  else
-    run mv "$BASE_IMG.part" "$BASE_IMG"
-  fi
-  ok "cloud image cached at $BASE_IMG"
+versioned_path() { printf '%s/%s-%s.img' "$CACHE_DIR" "$IMG_STEM" "${1:0:12}"; }
+
+upstream_sha() {  # prints the upstream sha256 of IMG_NAME; non-zero if the mirror is unreachable
+  curl -fsSL --retry 3 --max-time 60 -o "$WORKDIR/SHA256SUMS" "$SUMS_URL" 2>/dev/null || return 1
+  awk -v f="$IMG_NAME" '$2==f || $2==("*" f) {print $1; exit}' "$WORKDIR/SHA256SUMS"
 }
 
-if [[ -f "$BASE_IMG" ]]; then
-  # re-verify weekly against upstream to catch stale images
-  if [[ -n $(find "$BASE_IMG" -mtime +7 2>/dev/null) ]]; then
-    info "cached image older than 7 days, checking upstream checksum"
-    if curl -fsSL --max-time 20 -o "$WORKDIR/SHA256SUMS" "$SUMS_URL" 2>/dev/null; then
-      expected=$(awk -v f="*$IMG_NAME" '$2==f{print $1}' "$WORKDIR/SHA256SUMS")
-      have=$(cat "$BASE_IMG.sha256" 2>/dev/null || sha256sum "$BASE_IMG" | cut -d' ' -f1)
-      if [[ -n "$expected" && "$expected" != "$have" ]]; then info "upstream image changed, refreshing"; fetch_and_verify
-      else run touch "$BASE_IMG"; fi
+set_current() {  # atomically point <stem>.current at a verified versioned image
+  printf '%s\n' "$(basename "$1")" >"$CURRENT_PTR.tmp.$$" && mv -f "$CURRENT_PTR.tmp.$$" "$CURRENT_PTR"
+}
+
+fetch_and_verify() {  # $1 = expected sha256 (optional, looked up when empty)
+  local expected="${1:-}" dest part actual
+  if [[ $DRY_RUN -eq 1 ]]; then
+    BASE_IMG="$CACHE_DIR/$IMG_STEM-<sha256>.img"
+    run curl -fsSL --retry 3 -o "$BASE_IMG.part" "$IMG_URL"
+    return 0
+  fi
+  [[ -n "$expected" ]] || expected=$(upstream_sha) || true
+  [[ -n "$expected" ]] || { err "no checksum for $IMG_NAME in $SUMS_URL"; exit 3; }
+  dest=$(versioned_path "$expected")
+  if [[ -f "$dest" ]]; then
+    info "base image $dest already cached"
+  else
+    part="$dest.part.$$"
+    info "downloading $IMG_URL"
+    curl -fsSL --retry 3 -o "$part" "$IMG_URL" || { rm -f "$part"; err "download failed: $IMG_URL"; exit 3; }
+    actual=$(sha256sum "$part" | cut -d' ' -f1)
+    if [[ "$expected" != "$actual" ]]; then rm -f "$part"; err "checksum mismatch: expected $expected got $actual"; exit 3; fi
+    mv -n "$part" "$dest"; rm -f "$part"
+    printf '%s\n' "$actual" >"$dest.sha256"
+    chmod a-w "$dest" 2>/dev/null || true
+    ok "cloud image cached at $dest"
+  fi
+  set_current "$dest"
+  BASE_IMG="$dest"
+}
+
+cur=""
+[[ -f "$CURRENT_PTR" ]] && cur="$CACHE_DIR/$(head -n1 "$CURRENT_PTR")"
+if [[ -n "$cur" && -f "$cur" ]]; then
+  BASE_IMG="$cur"
+  # check upstream weekly; a newer image is downloaded next to the old one, never over it
+  if [[ -n $(find "$CURRENT_PTR" -mtime +7 2>/dev/null) ]]; then
+    info "cached image pointer older than 7 days, checking upstream checksum"
+    if expected=$(upstream_sha) && [[ -n "$expected" ]]; then
+      have=$(cat "$cur.sha256" 2>/dev/null || sha256sum "$cur" | cut -d' ' -f1)
+      if [[ "$expected" != "$have" ]]; then
+        info "upstream image changed, fetching a new base (old one kept for existing VMs)"
+        fetch_and_verify "$expected"
+      else run touch "$CURRENT_PTR"; fi
     else warn "could not reach mirror, using cached image"; fi
   else info "using cached image $BASE_IMG"; fi
 else

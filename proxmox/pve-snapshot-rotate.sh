@@ -2,7 +2,7 @@
 # pve-snapshot-rotate.sh - rotating snapshots for Proxmox VE VMs and containers.
 #
 # Part of bmh-infra-scripts (https://github.com/geetmangal/bmh-infra-scripts)
-# Maintained by the BookMyHost engineering team - https://bookmyhost.com/blog
+# Maintained by the BookMyHost engineering team - https://bookmyhost.com
 # Licence: MIT
 #
 # Exit codes:
@@ -94,7 +94,7 @@ Selection:
   --maintenance-tag T   guests with this tag are skipped (default: $MAINT_TAG)
 
 Rotation:
-  --keep N              snapshots (with --prefix) to keep per guest (default: $KEEP)
+  --keep N              snapshots (with --prefix) to keep per guest, >= 1 (default: $KEEP)
   --prefix NAME         snapshot name prefix (default: $PREFIX); name = PREFIX-YYYYmmdd-HHMMSS
   --vmstate             include RAM state for running VMs (qm only)
   --timeout SEC         per-operation timeout (default: $TIMEOUT)
@@ -162,7 +162,9 @@ sel=0
 if [[ $sel -ne 1 ]]; then
   err "exactly one of --vmids, --all or --tag is required"; exit 1
 fi
-[[ "$KEEP" =~ ^[0-9]+$ ]] || { err "--keep must be a non-negative integer"; exit 1; }
+[[ "$KEEP" =~ ^[0-9]+$ ]] || { err "--keep must be a positive integer"; exit 1; }
+# --keep 0 would mean "delete every snapshot, including the one just taken"; refuse it
+[[ "$KEEP" -ge 1 ]] || { err "--keep must be >= 1 (got $KEEP); to remove all snapshots use qm/pct delsnapshot by hand"; exit 1; }
 [[ "$PREFIX" =~ ^[A-Za-z][A-Za-z0-9_]{0,20}$ ]] || { err "--prefix must match [A-Za-z][A-Za-z0-9_]{0,20}"; exit 1; }
 [[ "$TIMEOUT" =~ ^[0-9]+$ ]] || { err "--timeout must be an integer"; exit 1; }
 
@@ -194,6 +196,35 @@ api() {  # method path [form-data...]
   local arg
   for arg in "$@"; do curl_opts+=(--data-urlencode "$arg"); done
   curl "${curl_opts[@]}" "$API_HOST/api2/json$path"
+}
+
+# Write calls in the PVE API are asynchronous: they return a task UPID right away and
+# the task can still fail later.  Poll /nodes/{node}/tasks/{upid}/status until it
+# stops (bounded by --timeout) and succeed only when exitstatus is "OK".
+api_task() {  # method path [form-data...]
+  local resp upid tnode enc status exitstatus deadline
+  resp=$(api "$@") || { err "API $1 $2 failed: $resp"; return 1; }
+  upid=$(jq -r '.data // empty' <<<"$resp" 2>/dev/null)
+  if [[ "$upid" != UPID:* ]]; then
+    err "API $1 $2 returned no task UPID: $resp"; return 1
+  fi
+  tnode=$(cut -d: -f2 <<<"$upid"); tnode="${tnode:-$NODE}"
+  enc=$(jq -rn --arg u "$upid" '$u|@uri')
+  deadline=$(( $(date +%s) + TIMEOUT ))
+  while :; do
+    resp=$(api GET "/nodes/$tnode/tasks/$enc/status") || { err "task status poll failed for $upid"; return 1; }
+    status=$(jq -r '.data.status // empty' <<<"$resp")
+    if [[ "$status" == "stopped" ]]; then
+      exitstatus=$(jq -r '.data.exitstatus // "unknown"' <<<"$resp")
+      debug "task $upid exitstatus=$exitstatus"
+      [[ "$exitstatus" == "OK" ]] && return 0
+      err "task $upid failed: $exitstatus"; return 1
+    fi
+    if (( $(date +%s) >= deadline )); then
+      err "task $upid still ${status:-unknown} after ${TIMEOUT}s (--timeout)"; return 1
+    fi
+    sleep "${PVE_TASK_POLL:-2}"
+  done
 }
 
 list_guests() {  # -> lines: vmid type name status tags
@@ -237,7 +268,7 @@ create_snap() {  # vmid type name
   if [[ $USE_API -eq 1 ]]; then
     local extra=()
     [[ "$type" == "qemu" && $VMSTATE -eq 1 ]] && extra+=("vmstate=1")
-    api POST "/nodes/$NODE/$type/$vmid/snapshot" "snapname=$name" "description=created by $SCRIPT_NAME" "${extra[@]}" >/dev/null
+    api_task POST "/nodes/$NODE/$type/$vmid/snapshot" "snapname=$name" "description=created by $SCRIPT_NAME" "${extra[@]}"
   else
     local cmd=("$(guest_tool "$type")" snapshot "$vmid" "$name" --description "created by $SCRIPT_NAME")
     [[ "$type" == "qemu" && $VMSTATE -eq 1 ]] && cmd+=(--vmstate 1)
@@ -248,7 +279,7 @@ create_snap() {  # vmid type name
 delete_snap() {  # vmid type name
   local vmid="$1" type="$2" name="$3"
   if [[ $USE_API -eq 1 ]]; then
-    api DELETE "/nodes/$NODE/$type/$vmid/snapshot/$name" >/dev/null
+    api_task DELETE "/nodes/$NODE/$type/$vmid/snapshot/$name"
   else
     timeout "$TIMEOUT" "$(guest_tool "$type")" delsnapshot "$vmid" "$name" >/dev/null
   fi

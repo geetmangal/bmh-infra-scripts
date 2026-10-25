@@ -76,6 +76,8 @@ PVE_API_TOKEN_FILE=/etc/pve-snap.token \
 pve-snapshot-rotate.sh --api --node pve1 --tag backup --keep 14
 ```
 
+In `--api` mode every create/delete call returns a task UPID; the script polls `/nodes/{node}/tasks/{upid}/status` until the task stops (bounded by `--timeout`) and reports the guest as failed unless `exitstatus` is `OK`. `--keep` must be at least 1.
+
 Cron (`/etc/cron.d/pve-snapshot-rotate`):
 
 ```cron
@@ -96,7 +98,7 @@ Cron (`/etc/cron.d/pve-snapshot-rotate`):
 
 A single command that gives you an Ubuntu VM you can SSH into:
 
-1. Downloads the official cloud image into a cache, verifies it against `SHA256SUMS`, and refreshes it when upstream changes (checked weekly).
+1. Downloads the official cloud image into a cache and verifies it against `SHA256SUMS`. Cached base images are immutable and versioned (`<image>-<sha256 prefix>.img`): when upstream publishes a new image (checked weekly) it is downloaded next to the old one and `<image>.current` is repointed, so new VMs use the newest base while existing VMs keep backing onto the file they were created from. Old base images are never modified or deleted by the script; remove one by hand only after `qemu-img info --backing-chain` shows no overlay uses it.
 2. Creates a thin qcow2 overlay on top of the image and resizes it to `--disk`.
 3. Generates cloud-init `user-data`, `meta-data` and `network-config`: user, SSH keys, hostname, static IP or DHCP, packages, runcmd. `qemu-guest-agent` is always installed.
 4. Builds the seed ISO with `cloud-localds`, or `genisoimage`/`xorrisofs` if that is missing.
@@ -151,8 +153,12 @@ sudo install -m 0755 bgp/anycast-healthcheck.py /usr/local/bin/
 sudo install -m 0644 bgp/anycast-healthcheck.service /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now anycast-healthcheck
 
-# one round, JSON, exit 0 healthy / 1 unhealthy - ideal for Nagios/Zabbix/CI
+# one round, JSON, exit 0 healthy / 1 unhealthy, report-only: never touches the
+# router or the state/metrics files, so it is safe for Nagios/Zabbix/CI probes
 ./bgp/anycast-healthcheck.py -c /etc/anycast-healthcheck.yaml --check-once --json
+
+# one round that really announces/withdraws (e.g. from cron instead of the daemon)
+./bgp/anycast-healthcheck.py -c /etc/anycast-healthcheck.yaml --check-once --apply
 
 # try it without touching the router
 ./bgp/anycast-healthcheck.py -c bgp/anycast-healthcheck.example.yaml --check-once --dry-run -v
@@ -166,6 +172,8 @@ The config is either JSON or a small YAML subset (maps, lists of maps, scalars a
 
 With `interval: 2` and `fail_threshold: 3`, the prefix is withdrawn about 6 s after the service fails. The total failover time is that plus your BGP convergence time.
 
+The announced/withdrawn state only changes after the router command succeeds. If `birdc`, `vbash` or an exec hook fails, the state stays as it was, the action is retried every interval, and `anycast_backend_action_failed` is 1 (with `anycast_backend_errors_total` counting attempts) until it goes through.
+
 | Exit | Meaning |
 |---|---|
 | 0 | healthy (`--check-once`) / clean shutdown |
@@ -175,10 +183,13 @@ With `interval: 2` and `fail_threshold: 3`, the prefix is withdrawn about 6 s af
 
 ## vcenter-snapshot-report.py
 
-Finds forgotten snapshots before they fill a datastore. It lists every VM snapshot along with its age, its real on-disk size (summed from `layoutEx` and counting shared delta files only once), the VM's power state, folder path and custom-attribute tags, and whether the VM needs consolidation.
+Finds forgotten snapshots before they fill a datastore. It lists every VM snapshot along with its age, the space it holds (from `layoutEx`: its state and memory files plus the delta disks written after it, never the base disk), the VM's state (on, off, suspended, template, or inaccessible/orphaned), folder path and custom-attribute tags, and whether the VM needs consolidation. The inventory is fetched with one paged PropertyCollector call, so a 2,500-VM vCenter is read in about 4 seconds.
+
+vCenter's default certificate is signed by its own VMCA. Pass `--ca-file` with the VMCA root certificate (from `https://<vcenter>/certs/download.zip`), or `--insecure` to skip verification. Tested read-only against vCenter 8.0.3; see [docs/testing.md](docs/testing.md).
 
 ```bash
 export VC_HOST=vcenter.example.net VC_USER='svc-report@vsphere.local'
+# self-signed VMCA cert: --ca-file vmca-root.pem (or --insecure)
 # password: VC_PASS env, --password-file (0600) or interactive prompt
 
 # everything older than a week, as a table
@@ -236,10 +247,6 @@ Run `make lint test` before you push. Bugs go in an [issue](.github/ISSUE_TEMPLA
 
 ## Infrastructure Partner
 
-These scripts are maintained by the engineering team at [BookMyHost](https://bookmyhost.com), an Indian cloud provider running NVMe KVM VPS on Proxmox/CloudStack with BGP anycast across Noida, Chennai and Mumbai. Deep dives on how we run this stack are on the BookMyHost Engineering Blog → https://bookmyhost.com/blog
+These scripts are maintained by the engineering team at [BookMyHost](https://bookmyhost.com), an Indian cloud provider running NVMe-backed KVM VPS on Apache CloudStack with Ceph storage and a BGP edge in Noida and Chennai.
 
-| Read on the blog | Related script |
-|---|---|
-| [How we rotate 2,000 Proxmox snapshots a night](https://bookmyhost.com/blog) <!-- TODO: replace with the final post URL --> | `proxmox/pve-snapshot-rotate.sh` |
-| [Anycast failover in under 10 seconds with BIRD 2](https://bookmyhost.com/blog) <!-- TODO: replace with the final post URL --> | `bgp/anycast-healthcheck.py` |
-| [Cloud-init KVM VMs in 60 seconds](https://bookmyhost.com/blog) <!-- TODO: replace with the final post URL --> | `kvm/cloud-init-vm.sh` |
+Deep-dive posts on how we use these scripts are coming soon on [bookmyhost.com](https://bookmyhost.com).
