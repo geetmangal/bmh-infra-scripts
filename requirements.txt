@@ -1,0 +1,5 @@
+# Runtime dependency only for vmware/vcenter-snapshot-report.py
+pyvmomi>=8.0.0,<9
+
+# Development / CI (install with: pip install -r requirements.txt ruff)
+# ruff>=0.5

@@ -1,0 +1,20 @@
+[Unit]
+Description=Anycast health check / BGP withdraw controller
+Documentation=https://github.com/geetmangal/bmh-infra-scripts
+After=network-online.target bird.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/anycast-healthcheck.py -c /etc/anycast-healthcheck.yaml --enforce-on-start
+Restart=always
+RestartSec=2
+User=root
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/run /etc/bird /var/lib/node_exporter/textfile
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

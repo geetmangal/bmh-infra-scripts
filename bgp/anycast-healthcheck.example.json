@@ -1,0 +1,14 @@
+{
+  "prefix": "203.0.113.53/32",
+  "interval": 2,
+  "fail_threshold": 3,
+  "ok_threshold": 5,
+  "backend": "exec",
+  "exec_up": "birdc enable anycast_static",
+  "exec_down": "birdc disable anycast_static",
+  "state_file": "/run/anycast-healthcheck.state",
+  "checks": [
+    {"name": "dns-udp", "type": "dns", "host": "203.0.113.53", "port": 53, "qname": "bookmyhost.com", "qtype": "A"},
+    {"name": "tcp-443", "type": "tcp", "host": "203.0.113.53", "port": 443}
+  ]
+}

@@ -1,0 +1,17 @@
+# Ruff configuration for bmh-infra-scripts
+target-version = "py38"
+line-length = 160
+extend-include = ["bgp/anycast-healthcheck.py", "vmware/vcenter-snapshot-report.py"]
+
+[lint]
+select = ["E", "F", "W", "B", "I", "UP", "S", "A", "N", "PL", "RUF"]
+ignore = [
+  "S101",            # assert in tests
+  "S603", "S607",    # subprocess with validated argv is the point of these tools
+  "PLR0912", "PLR0913", "PLR0915", "PLR2004", "PLR0911",  # CLI mains are long by nature
+  "UP006", "UP007", "UP035", "UP045", "PLC0415",  # keep typing.List/Optional for Python 3.8 compatibility
+  "RUF012", "E501",
+]
+
+[lint.per-file-ignores]
+"tests/*" = ["S", "PLR", "B", "RUF"]

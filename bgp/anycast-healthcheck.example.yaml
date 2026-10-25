@@ -1,0 +1,30 @@
+# anycast-healthcheck example config (YAML subset: maps, lists of maps, scalars, [inline, lists])
+# Copy to /etc/anycast-healthcheck.yaml and adjust.
+prefix: 203.0.113.53/32
+interval: 2
+fail_threshold: 3        # 3 x 2 s = withdraw ~6 s after the service dies
+ok_threshold: 5          # 5 x 2 s = re-announce 10 s after recovery
+backend: bird            # bird | vyos | exec
+bird_protocol: anycast_static
+# bird_state_file: /etc/bird/anycast-state.conf   # include-file mode instead of protocol toggle
+state_file: /run/anycast-healthcheck.state
+metrics_file: /var/lib/node_exporter/textfile/anycast.prom
+checks:
+  - name: dns-udp
+    type: dns
+    host: 203.0.113.53
+    port: 53
+    qname: bookmyhost.com
+    qtype: A
+    timeout: 1.5
+  - name: https
+    type: http
+    url: https://203.0.113.53/healthz
+    host: www.example.com        # sent as Host header
+    expect_status: [200, 204]
+    body_regex: '"status":\s*"ok"'
+    verify_tls: false
+  - name: tcp-853
+    type: tcp
+    host: 203.0.113.53
+    port: 853
