@@ -56,18 +56,20 @@ _log() {
   else
     printf '%s\n' "$line" >&2
   fi
-  [[ -n "$LOG_FILE" ]] && printf '%s\n' "$line" >>"$LOG_FILE" || true
+  if [[ -n "$LOG_FILE" ]]; then printf '%s\n' "$line" >>"$LOG_FILE" || true; fi
 }
 info()  { _log INFO  "$C_BLU" "$@"; }
 ok()    { _log OK    "$C_GRN" "$@"; }
 warn()  { _log WARN  "$C_YEL" "$@"; }
 err()   { _log ERROR "$C_RED" "$@"; }
 # shellcheck disable=SC2329  # used when DEBUG=1 is set by the operator
-debug() { [[ "${DEBUG:-0}" == "1" ]] && _log DEBUG "$C_DIM" "$@" || true; }
+debug() { if [[ "${DEBUG:-0}" == "1" ]]; then _log DEBUG "$C_DIM" "$@"; fi; }
 
 # ---------- cleanup ----------
 TMPDIR_WORK=""
 # shellcheck disable=SC2329  # invoked via trap
+# invoked via trap; older shellcheck reports its body as unreachable
+# shellcheck disable=SC2317,SC2015
 cleanup() {
   local rc=$?
   [[ -n "$TMPDIR_WORK" && -d "$TMPDIR_WORK" ]] && rm -rf "$TMPDIR_WORK"

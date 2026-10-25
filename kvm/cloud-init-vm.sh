@@ -74,6 +74,8 @@ run() {
 WORKDIR=""
 CREATED_DISK=""
 # shellcheck disable=SC2329  # invoked via trap
+# invoked via trap; older shellcheck reports its body as unreachable
+# shellcheck disable=SC2317,SC2015
 cleanup() {
   local rc=$?
   [[ -n "$WORKDIR" && -d "$WORKDIR" ]] && rm -rf "$WORKDIR"
