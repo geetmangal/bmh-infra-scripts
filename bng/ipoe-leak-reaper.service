@@ -1,0 +1,16 @@
+[Unit]
+Description=accel-ppp IPoE leaked-session reaper
+Documentation=https://github.com/ (bmh-infra-scripts/bng/README.md)
+After=accel-ppp@ipoe.service
+# Does nothing if the ipoe module/genl family is absent (exits 2, logged).
+
+[Service]
+Type=oneshot
+# REPORT MODE by default: detects leaks and logs them, deletes nothing.
+# To enable automatic reaping, append:  --reap
+# (reaps only leaks that have persisted >= --min-age seconds, default 60).
+ExecStart=/config/scripts/ipoe-leak-reaper.py --port 2002 --quiet \
+          --state /run/ipoe-leak-reaper.state \
+          --log /var/log/ipoe-leak-reaper.log
+Nice=10
+# Read-only in report mode; reaping needs CAP_NET_ADMIN (runs as root here).

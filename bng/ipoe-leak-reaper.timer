@@ -1,0 +1,14 @@
+[Unit]
+Description=Run the accel-ppp IPoE leaked-session reaper periodically
+
+[Timer]
+# Every 2 minutes, a little after boot. With --min-age 60 (default) a real leak
+# is confirmed on the 2nd consecutive sighting (~2-4 min to reap), while a
+# brand-new session in the module-but-not-daemon window is never touched.
+OnBootSec=3min
+OnUnitActiveSec=2min
+AccuracySec=15s
+Persistent=false
+
+[Install]
+WantedBy=timers.target
